@@ -1,0 +1,7 @@
+# Hub can read/write everything
+user hub
+topic readwrite screening/#
+
+# Every other user may only use screening/<their own username>/...
+# so username MUST equal STATION_ID
+pattern readwrite screening/%u/#
