@@ -1,0 +1,68 @@
+
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ESP32-S3 RFID pin configuration
+#define SS_PIN    10
+#define RST_PIN   9
+#define SCK_PIN   12
+#define MOSI_PIN  11
+#define MISO_PIN  13
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("ESP32-S3 RFID Test");
+  Serial.println("Initializing RFID reader...");
+
+  // Initialize SPI
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+
+  // Initialize MFRC522
+  rfid.PCD_Init();
+  delay(100);
+  rfid.PCD_AntennaOn();
+
+  Serial.println("RFID reader ready!");
+  Serial.println("Scan your RFID card...");
+}
+
+void loop() {
+
+  // Check if a new RFID card is present
+  if (!rfid.PICC_IsNewCardPresent()) {
+    delay(50);
+    return;
+  }
+
+  // Read RFID card UID
+  if (!rfid.PICC_ReadCardSerial()) {
+    delay(50);
+    return;
+  }
+
+  String uid = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+
+    if (rfid.uid.uidByte[i] < 0x10) {
+      uid += "0";
+    }
+
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  uid.toUpperCase();
+
+  Serial.print("RFID Card Detected! UID: ");
+  Serial.println(uid);
+
+  // Stop communication with current card
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  delay(1000);
+}
