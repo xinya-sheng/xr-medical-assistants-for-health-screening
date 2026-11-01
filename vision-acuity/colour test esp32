@@ -1,0 +1,329 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <esp_system.h>
+
+// RFID Config
+#define SS_PIN    10
+#define RST_PIN   9
+#define SCK_PIN   12
+#define MOSI_PIN  11
+#define MISO_PIN  13
+bool testActive = false;
+String activeSessionId = "";
+String activeUid = "";
+
+// MQTT config 
+const char* WIFI_SSID = "";
+const char* WIFI_PASSWORD = "";
+
+const char* MQTT_SERVER = "";
+const int MQTT_PORT = 1883;
+
+const char* MQTT_USER = "colourvision01";
+const char* MQTT_PASSWORD = "colourvision01";
+
+String clientId = "esp-" + String(MQTT_USER);
+String baseTopic = "screening/" + String(MQTT_USER);
+
+String SCAN_TOPIC = baseTopic + "/scan";
+String RESULT_TOPIC = baseTopic + "/result";
+String ACK_TOPIC = baseTopic + "/ack";
+
+bool waitingForAck = false;
+String pendingResult = "";
+
+unsigned long lastResultPublish = 0;
+const unsigned long ACK_RETRY_INTERVAL = 5000;
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+void connectWiFi() {
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void maintainMQTT() {
+  static unsigned long lastAttempt = 0;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  if (mqttClient.connected()) {
+    mqttClient.loop();
+    return;
+  }
+
+  if (millis() - lastAttempt < 5000) {
+    return;
+  }
+
+  lastAttempt = millis();
+
+  if (mqttClient.connect(
+        clientId.c_str(),
+        MQTT_USER,
+        MQTT_PASSWORD
+      )) {
+    Serial.println("MQTT_CONNECTED");
+    mqttClient.subscribe(ACK_TOPIC.c_str(), 1);
+    Serial.println("ACK_SUBSCRIBED");
+  }
+}
+
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (String(topic) != ACK_TOPIC) {
+    return;
+  }
+
+  JsonDocument doc;
+
+  DeserializationError error =
+      deserializeJson(doc, payload, length);
+
+  if (error) {
+    Serial.println("ACK_JSON_ERROR");
+    return;
+  }
+
+  String ackSession = doc["session_id"] | "";
+  String ackUid = doc["uid"] | "";
+  bool accepted = doc["ok"] | false;
+
+  if (!waitingForAck ||
+      !accepted ||
+      ackSession != activeSessionId ||
+      ackUid != activeUid) {
+    Serial.println("ACK_IGNORED");
+    return;
+  }
+
+  Serial.println("HUB_ACK_RECEIVED");
+
+  waitingForAck = false;
+  pendingResult = "";
+
+  activeUid = "";
+  activeSessionId = "";
+  testActive = false;
+
+  Serial.println("READY_FOR_NEXT_STUDENT");
+}
+
+void publishPendingResult() {
+  if (!waitingForAck || pendingResult.length() == 0) {
+    return;
+  }
+
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  if (lastResultPublish != 0 &&
+      millis() - lastResultPublish < ACK_RETRY_INTERVAL) {
+    return;
+  }
+
+  lastResultPublish = millis();
+
+  bool published = mqttClient.publish(
+      RESULT_TOPIC.c_str(),
+      pendingResult.c_str()
+  );
+
+  Serial.println(
+      published ? "MQTT_RESULT_SENT" : "MQTT_RESULT_FAILED"
+  );
+}
+
+String generateSessionId()
+{
+    char id[33];
+
+    snprintf(
+        id,
+        sizeof(id),
+        "%08lx%08lx%08lx%08lx",
+        (unsigned long)esp_random(),
+        (unsigned long)esp_random(),
+        (unsigned long)esp_random(),
+        (unsigned long)esp_random()
+    );
+
+    return String(id);
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  Serial.println("ESP32_READY");
+
+  // Initialize SPI bus
+  SPI.begin(SCK_PIN, MISO_PIN, MOSI_PIN, SS_PIN);
+
+  rfid.PCD_Init();
+  delay(100);
+  rfid.PCD_AntennaOn();
+
+  Serial.println("RFID_READY");
+
+  // Initialise MQTT
+  WiFi.mode(WIFI_STA);
+  connectWiFi();
+  mqttClient.setServer(MQTT_SERVER, MQTT_PORT);
+  mqttClient.setCallback(mqttCallback);
+}
+
+void loop() {
+
+  maintainMQTT();
+  checkUnityMessages();
+  publishPendingResult();
+  
+if (testActive) {
+    delay(10);
+    return;
+}
+
+  if (!rfid.PICC_IsNewCardPresent()) {
+    delay(50);
+    return;
+  }
+
+  if (!rfid.PICC_ReadCardSerial()) {
+    delay(50);
+    return;
+  }
+
+  // Convert UID to hexadecimal string
+  String uid = "";
+
+  for (byte i = 0; i < rfid.uid.size; i++) {
+    if (rfid.uid.uidByte[i] < 0x10) {
+      uid += "0";
+    }
+
+    uid += String(rfid.uid.uidByte[i], HEX);
+  }
+
+  uid.toUpperCase();
+  if (mqttClient.connected()) {
+    String payload = "{\"uid\":\"" + uid + "\"}";
+
+    bool sent = mqttClient.publish(
+      SCAN_TOPIC.c_str(),
+      payload.c_str()
+    );
+
+    if (sent) {
+      Serial.println("MQTT_SCAN_SENT");
+    } else {
+      Serial.println("MQTT_SCAN_FAILED");
+    }
+  } else {
+    Serial.println("MQTT_NOT_CONNECTED");
+  }
+
+  // Generate a session ID for this scan
+  String sessionId = generateSessionId();
+
+  // Send message to Unity
+  String message = "START_TEST," + uid + "," + sessionId;
+  Serial.println(message);
+  Serial.flush();
+
+  // Start test, wait for results
+  activeUid = uid;
+  activeSessionId = sessionId;
+  testActive = true;
+
+  // Stop communication with the RFID card
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+
+  delay(1000);
+}
+
+void checkUnityMessages() {
+  if (Serial.available() <= 0) {
+    return;
+  }
+
+  String message = Serial.readStringUntil('\n');
+  message.trim();
+
+  if (!message.startsWith("{")) {
+    return;
+  }
+
+  JsonDocument unityDoc;
+
+  DeserializationError error =
+      deserializeJson(unityDoc, message);
+
+  if (error) {
+    Serial.println("UNITY_JSON_ERROR");
+    return;
+  }
+
+  String type = unityDoc["type"] | "";
+
+  if (type != "TEST_COMPLETE") {
+    return;
+  }
+
+  if (!testActive || waitingForAck) {
+    Serial.println("UNEXPECTED_RESULT");
+    return;
+  }
+
+  String receivedSession = unityDoc["session_id"] | "";
+  String receivedUid = unityDoc["student_id"] | "";
+
+  if (receivedSession != activeSessionId ||
+      !receivedUid.equalsIgnoreCase(activeUid)) {
+    Serial.println("SESSION_MISMATCH");
+    return;
+  }
+
+  int score = unityDoc["score"] | -1;
+  int maxScore = unityDoc["max_score"] | -1;
+  String assessment = unityDoc["assessment"] | "";
+  String testType = unityDoc["test_type"] | "";
+
+  if (score < 0 || maxScore <= 0 ||
+      score > maxScore ||
+      testType != "ishihara" ||
+      assessment.length() == 0) {
+    Serial.println("INVALID_TEST_RESULT");
+    return;
+  }
+
+  JsonDocument resultDoc;
+
+  resultDoc["uid"] = activeUid;
+  resultDoc["session_id"] = activeSessionId;
+
+  // hub.py can supply its receipt time when ts is omitted.
+  JsonObject data = resultDoc["data"].to<JsonObject>();
+
+  data["test_type"] = testType;
+  data["score"] = score;
+  data["max_score"] = maxScore;
+  data["assessment"] = assessment;
+
+  pendingResult = "";
+  serializeJson(resultDoc, pendingResult);
+
+  waitingForAck = true;
+  lastResultPublish = 0;
+
+  Serial.println("RESULT_RECEIVED");
+  Serial.println("RESULT_READY_FOR_MQTT");
+}
