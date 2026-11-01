@@ -1,0 +1,137 @@
+SCREENING SYSTEM - LOCAL STARTUP (Windows / PowerShell, native install)
+=========================================================================
+
+Project folder:
+C:\Users\simho\Documents\National University of Singapore\EE4002D\Source\screening-system
+
+Mosquitto install folder (adjust if different):
+C:\Program Files\mosquitto
+
+If "mosquitto" / "mosquitto_pub" / "mosquitto_sub" / "mosquitto_passwd" are not
+recognized as commands, either:
+  a) use the full path every time, e.g.
+     & "C:\Program Files\mosquitto\mosquitto.exe" -c .\mosquitto.conf -v
+  b) fix PATH permanently (one-time):
+     [Environment]::SetEnvironmentVariable("Path", [Environment]::GetEnvironmentVariable("Path","User") + ";C:\Program Files\mosquitto", "User")
+     Then FULLY close and reopen VS Code (all windows) for it to take effect.
+
+One-time setup (only needed once, or whenever you want a fresh password):
+---------------------------------------------------------------------------
+cd "C:\Users\simho\Documents\National University of Singapore\EE4002D\Source\screening-system\broker"
+mosquitto_passwd -c passwd hub
+  -> enter a password when prompted, remember it (used as MQTT_PASS below)
+
+If the Mosquitto Windows service is running and blocking port 1883, stop it
+(needs Admin PowerShell, or use services.msc GUI):
+  Stop-Service mosquitto
+  Set-Service mosquitto -StartupType Disabled
+
+
+TERMINAL 1 - Broker
+---------------------------------------------------------------------------
+cd "C:\Users\simho\Documents\National University of Singapore\EE4002D\Source\screening-system\broker"
+mosquitto -c .\mosquitto.conf -v
+
+Wait for: "Opening ipv4 listen socket on port 1883"
+Leave this running. Ctrl+C to stop.
+
+
+TERMINAL 2 - Hub (writes to screening.db)
+---------------------------------------------------------------------------
+cd "C:\Users\simho\Documents\National University of Singapore\EE4002D\Source\screening-system"
+.venv\Scripts\Activate.ps1
+$env:MQTT_PASS = "<the password you set above>"
+python hub.py
+
+Wait for: "connected to localhost:1883, db=screening.db"
+Leave this running. Ctrl+C to stop.
+
+
+TERMINAL 3 - Dashboard
+---------------------------------------------------------------------------
+cd "C:\Users\simho\Documents\National University of Singapore\EE4002D\Source\screening-system"
+.venv\Scripts\Activate.ps1
+streamlit run dashboard.py
+
+Opens automatically at: http://localhost:8501
+Leave this running. Ctrl+C to stop.
+
+
+TESTING PUB/SUB (4th terminal, no venv needed)
+===========================================================================
+This confirms the broker, auth, and topic routing all work, independent of
+the ESP32 or the hub.
+
+1) Open a SUBSCRIBER to watch all screening traffic (leave this running,
+   you'll see messages appear live as you publish in the next step):
+
+cd "C:\Users\simho\Documents\National University of Singapore\EE4002D\Source\screening-systembroker"
+mosquitto_sub -h localhost -u hub -P <password> -t "screening/#" -v
+
+   -t "screening/#" subscribes to every topic under screening/, -v prints
+   the topic name alongside each message.
+
+2) In a 5th terminal, PUBLISH a fake scan:
+
+   NOTE on PowerShell quoting: both -m "...\"..." (backslash-escaped) and
+   -m '...' (single-quoted) have been observed to get mangled by Windows
+   PowerShell when calling native .exe files - quotes can get silently
+   stripped, especially with nested JSON objects. The RELIABLE method is
+   to write the JSON to a file and use mosquitto_pub -f instead of -m.
+   Use this method every time:
+
+   '{"uid":"04A1B2C3","ts":"2026-10-18T10:00:00Z"}' | Out-File -Encoding ascii -NoNewline scan.json
+   mosquitto_pub -h localhost -u hub -P <password> -t screening/station01/scan -f scan.json
+
+   (-Encoding ascii and -NoNewline both matter. IMPORTANT: do NOT use
+   -Encoding utf8 here - on Windows PowerShell 5.1 it silently prepends a
+   UTF-8 BOM to the file, which mosquitto_pub -f sends as part of the
+   payload, which then makes hub.py's JSON parser fail with "result is
+   not a JSON object" / "scan without uid" even though the JSON text
+   itself looks correct. ascii has no BOM and the payloads here are plain
+   ASCII anyway, so it's the safe choice.)
+
+   You should see this line appear in the Terminal 1 (hub.py) log as:
+     scan    station01  04A1B2C3
+   and in the subscriber terminal from step 1.
+
+3) Publish a fake result (this is what gets stored + shown on the dashboard):
+
+   '{"uid":"04A1B2C3","session_id":"test-1","ts":"2026-10-18T10:01:00Z","data":{"height_cm":170}}' | Out-File -Encoding ascii -NoNewline result.json
+   mosquitto_pub -h localhost -u hub -P <password> -t screening/station01/result -f result.json
+
+   hub.py should log:
+     result  station01  04A1B2C3  {'height_cm': 170}
+   and publish an ack back on screening/station01/ack - you'll see that in
+   your subscriber terminal too.
+
+4) Refresh http://localhost:8501 - you should now see:
+   - Participants: 1
+   - Results: 1
+   - station01 listed with the result row
+
+If step 2/3 show nothing in hub.py's log, check:
+  - hub.py and your mosquitto_pub are using the SAME password you created
+    with mosquitto_passwd.
+  - The broker terminal (Terminal 1) is still running and didn't error out.
+  - Use the -f file method above, not -m with inline JSON - PowerShell's
+    native-exe argument quoting is unreliable and will silently strip the
+    double quotes out of your JSON, which hub.py then rejects as "not a
+    JSON object" (you can confirm this by checking raw_messages.error,
+    see below).
+
+CHECKING WHAT WENT WRONG (if hub.py logs a "bad message" warning)
+---------------------------------------------------------------------------
+Run from the project root (where screening.db lives), inside the venv:
+
+python -c "import sqlite3; c=sqlite3.connect('screening.db'); print(c.execute('SELECT topic, payload, error FROM raw_messages WHERE error IS NOT NULL').fetchall())"
+
+This shows the exact topic, the raw payload mosquitto_pub actually sent
+(useful for spotting mangled quotes), and the error hub.py raised.
+
+
+FIREWALL (only needed once, for the ESP32 to reach this laptop later)
+---------------------------------------------------------------------------
+Run in an Admin PowerShell:
+New-NetFirewallRule -DisplayName "MQTT" -Direction Inbound -LocalPort 1883 -Protocol TCP -Action Allow
+New-NetFirewallRule -DisplayName "Streamlit" -Direction Inbound -LocalPort 8501 -Protocol TCP -Action Allow
